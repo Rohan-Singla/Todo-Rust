@@ -1,74 +1,76 @@
 use axum::{
     extract::{Path, State},
-    routing::{get, post, delete},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{sync::{Arc, Mutex}, collections::HashMap, net::SocketAddr};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
 use uuid::Uuid;
+use tracing_subscriber;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+// MODELS
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Todo {
-    id: String,
-    task: String,
-    done: bool,
-}
-
-// App state with shared in-memory storage
-type Db = Arc<Mutex<HashMap<String, Todo>>>;
-
-#[tokio::main]
-async fn main() {
-    let db: Db = Arc::new(Mutex::new(HashMap::new()));
-
-    let app = Router::new()
-        .route("/todos", get(list_todos).post(add_todo))
-        .route("/todos/:id", delete(delete_todo))
-        .with_state(db.clone());
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    println!("Server running at http://{}", addr);
-
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
-}
-
-async fn list_todos(State(db): State<Db>) -> Json<Vec<Todo>> {
-    let db = db.lock().unwrap();
-    let todos = db.values().cloned().collect();
-    Json(todos)
+    id: Uuid,
+    title: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateTodo {
-    task: String,
+    title: String,
 }
 
-async fn add_todo(
-    State(db): State<Db>,
+// APP STATE
+type SharedState = Arc<Mutex<Vec<Todo>>>;
+
+// HANDLERS
+async fn get_todos(State(state): State<SharedState>) -> impl IntoResponse {
+    let todos = state.lock().unwrap();
+    Json(todos.clone())
+}
+
+async fn create_todo(
+    State(state): State<SharedState>,
     Json(payload): Json<CreateTodo>,
-) -> Json<Todo> {
-    let id = Uuid::new_v4().to_string();
+) -> impl IntoResponse {
+    let mut todos = state.lock().unwrap();
     let todo = Todo {
-        id: id.clone(),
-        task: payload.task,
-        done: false,
+        id: Uuid::new_v4(),
+        title: payload.title,
     };
-
-    db.lock().unwrap().insert(id.clone(), todo.clone());
-    Json(todo)
+    todos.push(todo.clone());
+    (StatusCode::CREATED, Json(todo))
 }
 
-async fn delete_todo(
-    Path(id): Path<String>,
-    State(db): State<Db>,
-) -> Json<String> {
-    let mut db = db.lock().unwrap();
-    if db.remove(&id).is_some() {
-        Json(format!("Deleted todo {}", id))
+async fn delete_todo(State(state): State<SharedState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    let mut todos = state.lock().unwrap();
+    let len_before = todos.len();
+    todos.retain(|todo| todo.id != id);
+    let deleted = len_before != todos.len();
+
+    if deleted {
+        (StatusCode::OK, "Deleted").into_response()
     } else {
-        Json("Todo not found".to_string())
+        (StatusCode::NOT_FOUND, "Todo not found").into_response()
     }
+}
+
+// MAIN
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let state: SharedState = Arc::new(Mutex::new(Vec::new()));
+
+    let app = Router::new()
+        .route("/todos", get(get_todos).post(create_todo))
+        .route("/todos/{id}", delete(delete_todo))
+        .with_state(state);
+
+    println!("Listening at port 3000");
+    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
